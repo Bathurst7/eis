@@ -2,12 +2,10 @@
 CREATE OR REPLACE FUNCTION validate_email()
 RETURNS TRIGGER AS $$
 BEGIN
-    -- Kiểm tra cú pháp email hợp lệ
     IF NOT (NEW.E_MAIL_ADDRESS ~ '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$') THEN
-        RAISE EXCEPTION 'Email không hợp lệ: %', NEW.E_MAIL_ADDRESS;
+        RAISE EXCEPTION 'Invalid Email: %', NEW.E_MAIL_ADDRESS;
     END IF;
 
-    -- Kiểm tra trùng lặp email trong bảng tương ứng
     IF TG_TABLE_NAME = 'applicant' THEN
         IF EXISTS (
             SELECT 1 
@@ -15,7 +13,7 @@ BEGIN
             WHERE E_MAIL_ADDRESS = NEW.E_MAIL_ADDRESS
               AND APPLICANT_ID != NEW.APPLICANT_ID -- Đảm bảo không tự so sánh
         ) THEN
-            RAISE EXCEPTION 'Email đã tồn tại trong bảng APPLICANT: %', NEW.E_MAIL_ADDRESS;
+            RAISE EXCEPTION 'Email already exists in the APPLICANT table: %', NEW.E_MAIL_ADDRESS;
         END IF;
     ELSIF TG_TABLE_NAME = 'employee' THEN
         IF EXISTS (
@@ -24,7 +22,7 @@ BEGIN
             WHERE E_MAIL_ADDRESS = NEW.E_MAIL_ADDRESS
               AND EMPLOYEE_ID != NEW.EMPLOYEE_ID -- Đảm bảo không tự so sánh
         ) THEN
-            RAISE EXCEPTION 'Email đã tồn tại trong bảng EMPLOYEE: %', NEW.E_MAIL_ADDRESS;
+            RAISE EXCEPTION 'Email already exists in the EMPLOYEE table: %', NEW.E_MAIL_ADDRESS;
         END IF;
     END IF;
 
@@ -71,22 +69,37 @@ EXECUTE FUNCTION validate_phone_number();
 
 --------------------------------------------------------
 ---TRIGGER TO VALIDATE TIME
-CREATE OR REPLACE FUNCTION validate_timestamps()
+CREATE OR REPLACE FUNCTION validate_job_description_timestamp()
 RETURNS TRIGGER AS $$
 BEGIN
-    -- Kiểm tra thời gian kết thúc trong JOB_DESCRIPTION
-    IF TG_TABLE_NAME = 'job_description' AND NEW.END_TIME < NOW() THEN
+    IF NEW.END_TIME < NOW() THEN
         RAISE EXCEPTION 'END_TIME must be in the future: %', NEW.END_TIME;
     END IF;
-
-    -- Kiểm tra lịch phỏng vấn trong INTERVIEW
-    IF TG_TABLE_NAME = 'interview' AND NEW.SCHEDULE_DATE < NOW() THEN
-        RAISE EXCEPTION 'SCHEDULE_DATE must be in the future: %', NEW.SCHEDULE_DATE;
-    END IF;
-
     RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
+--
+CREATE TRIGGER validate_job_description_end_time
+BEFORE INSERT OR UPDATE ON job_description
+FOR EACH ROW
+EXECUTE FUNCTION validate_job_description_timestamp();
+
+--FOR INTERVIEW
+CREATE OR REPLACE FUNCTION validate_interview_timestamp()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF NEW.SCHEDULE_DATE < NOW() THEN
+        RAISE EXCEPTION 'SCHEDULE_DATE must be in the future: %', NEW.SCHEDULE_DATE;
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+-- 
+CREATE TRIGGER validate_interview_schedule_date
+BEFORE INSERT OR UPDATE ON interview
+FOR EACH ROW
+EXECUTE FUNCTION validate_interview_timestamp();
 
 ---CREATE TRIGGER FOR JOB_DESCRIPTION
 CREATE TRIGGER check_job_description_end_time
@@ -99,8 +112,8 @@ EXECUTE FUNCTION validate_timestamps();
 CREATE OR REPLACE FUNCTION validate_partial_evaluation()
 RETURNS TRIGGER AS $$
 BEGIN
-    IF NEW.partial_evaluation < 0 OR NEW.partial_evaluation > 10 THEN
-        RAISE EXCEPTION 'Partial evaluation must be between 0 and 10: %', NEW.partial_evaluation;
+    IF NEW.partial_evaluation < 0 OR NEW.partial_evaluation > 100 THEN
+        RAISE EXCEPTION 'Partial evaluation must be between 0 and 100: %', NEW.partial_evaluation;
     END IF;
     RETURN NEW;
 END;
@@ -143,6 +156,126 @@ EXECUTE FUNCTION update_interview_evaluation();
 CREATE OR REPLACE FUNCTION check_interview_schedule()
 RETURNS TRIGGER AS $$
 BEGIN
+    -- Only check for conflicts if SCHEDULE_DATE is modified
+    IF NEW.SCHEDULE_DATE <> OLD.SCHEDULE_DATE THEN
+        IF EXISTS (
+            SELECT 1
+            FROM INTERVIEW
+            WHERE APPLICATION_ID IN (
+                SELECT APPLICATION_ID
+                FROM APPLICATION
+                WHERE APPLICANT_ID = (
+                    SELECT APPLICANT_ID
+                    FROM APPLICATION
+                    WHERE APPLICATION_ID = NEW.APPLICATION_ID
+                )
+            )
+            AND SCHEDULE_DATE = NEW.SCHEDULE_DATE
+        ) THEN
+            RAISE EXCEPTION 'Applicant already has an interview scheduled at this time: %', NEW.SCHEDULE_DATE;
+        END IF;
+    END IF;
+
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+
+--FOR INTERVIEWER
+CREATE OR REPLACE FUNCTION check_interviewer_schedule()
+RETURNS TRIGGER AS $$
+BEGIN
+    -- Only check for conflicts if SCHEDULE_DATE is modified
+    IF NEW.SCHEDULE_DATE <> OLD.SCHEDULE_DATE THEN
+        IF EXISTS (
+            SELECT 1
+            FROM INTERVIEW_DETAIL id
+            JOIN INTERVIEW i ON id.INTERVIEW_ID = i.INTERVIEW_ID
+            WHERE id.INTERVIEWER_ID IN (
+                SELECT INTERVIEWER_ID
+                FROM INTERVIEW_DETAIL
+                WHERE INTERVIEW_ID = NEW.INTERVIEW_ID
+            )
+            AND i.SCHEDULE_DATE = NEW.SCHEDULE_DATE
+        ) THEN
+            RAISE EXCEPTION 'Interviewer already has an interview scheduled at this time: %', NEW.SCHEDULE_DATE;
+        END IF;
+    END IF;
+
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+
+----
+--- PROCEDURE UPDATE SCHEDULE DATE IN INTERVIEW TABLES
+CREATE OR REPLACE PROCEDURE update_schedule_date(interview_id_input INT, new_schedule_date TIMESTAMP) 
+LANGUAGE plpgsql AS $$
+BEGIN
+    UPDATE INTERVIEW
+    SET SCHEDULE_DATE = new_schedule_date
+    WHERE INTERVIEW_ID = interview_id_input;
+
+    RAISE NOTICE 'New interview schedule has been updated: %', new_schedule_date;
+END;
+$$;
+----------
+---CALL update_schedule_date(1, '2025-01-25 10:00:00');
+
+---SELECT  * FROM INTERVIEW
+
+--- PROCEDURE UPDATE STATUS FOR APPLICATION TABLE 
+CREATE OR REPLACE PROCEDURE update_application_status(
+    application_id_input INT,
+    new_application_status VARCHAR(30)
+)
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    UPDATE APPLICATION
+    SET APPLICATION_STATUS = new_application_status
+    WHERE APPLICATION_ID = application_id_input;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Application with ID % not found.', application_id_input;
+    END IF;
+    RAISE NOTICE 'Application status updated to: %', new_application_status;
+END;
+$$;
+
+--- PROCEDURE UPDATE STATUS FOR INTERVIEW TABLE: 
+CREATE OR REPLACE PROCEDURE update_interview_status(
+    interview_id_input INT,
+    new_interview_status VARCHAR(30)
+)
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    -- Update the INTERVIEW_STATUS field
+    UPDATE INTERVIEW
+    SET INTERVIEW_STATUS = new_interview_status
+    WHERE INTERVIEW_ID = interview_id_input;
+
+    -- Check if the update was successful
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Interview with ID % not found.', interview_id_input;
+    END IF;
+
+    -- Notify the successful update
+    RAISE NOTICE 'Interview status updated to: %', new_interview_status;
+END;
+$$;
+
+---
+CREATE OR REPLACE FUNCTION check_schedule_conflict()
+RETURNS TRIGGER AS $$
+BEGIN
+    -- Only check for conflicts if SCHEDULE_DATE is being modified
+    IF TG_OP = 'UPDATE' AND NEW.SCHEDULE_DATE = OLD.SCHEDULE_DATE THEN
+        RETURN NEW;
+    END IF;
+
+    -- Check if the applicant already has an interview at the same time
     IF EXISTS (
         SELECT 1
         FROM INTERVIEW
@@ -164,34 +297,7 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
-CREATE TRIGGER trg_check_interview_schedule
+CREATE TRIGGER trg_check_schedule_conflict
 BEFORE INSERT OR UPDATE ON INTERVIEW
 FOR EACH ROW
-EXECUTE FUNCTION check_interview_schedule();
-
---FOR INTERVIEWER
-CREATE OR REPLACE FUNCTION check_interviewer_schedule()
-RETURNS TRIGGER AS $$
-BEGIN
-    IF EXISTS (
-        SELECT 1
-        FROM INTERVIEW_DETAIL id
-        JOIN INTERVIEW i ON id.INTERVIEW_ID = i.INTERVIEW_ID
-        WHERE id.INTERVIEWER_ID IN (
-            SELECT INTERVIEWER_ID
-            FROM INTERVIEW_DETAIL
-            WHERE INTERVIEW_ID = NEW.INTERVIEW_ID
-        )
-        AND i.SCHEDULE_DATE = NEW.SCHEDULE_DATE
-    ) THEN
-        RAISE EXCEPTION 'Interviewer already has an interview scheduled at this time: %', NEW.SCHEDULE_DATE;
-    END IF;
-
-    RETURN NEW;
-END;
-$$ LANGUAGE plpgsql;
-
-CREATE TRIGGER trg_check_interviewer_schedule
-BEFORE INSERT OR UPDATE ON INTERVIEW
-FOR EACH ROW
-EXECUTE FUNCTION check_interviewer_schedule();
+EXECUTE FUNCTION check_schedule_conflict();
